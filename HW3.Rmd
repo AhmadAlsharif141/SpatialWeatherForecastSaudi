@@ -1,0 +1,247 @@
+---
+title: "HW3"
+output: html_document
+date: "2026-10-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Libraries
+library(sf)
+library(terra)
+library(tidyverse)
+```
+
+```{r}
+#Check the layers of the raster data to decide which to use for the task
+#Also you can use QGIS to show what the layer is representing
+st_layers("data/gadm41_SAU.gpkg")
+
+# HOW TO DECIDE:
+#   - "features" = number of polygons in that layer.
+#   - Level 0 has 1 feature = the whole country. That's what we need
+#     to crop/mask the rasters to the national boundary.
+#   - Level 1 would be useful if you wanted stats per province.
+
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# 1. COUNTRY OUTLINE (GADM)  -- checking which LAYER to read
+
+ 
+saudi <- st_read("data/gadm41_SAU.gpkg", layer = "ADM_ADM_0")
+ 
+# Quick checks on what you loaded:
+saudi            # prints attributes + geometry type + CRS
+
+
+st_crs(saudi)    # coordinate reference system (should be WGS 84 / EPSG:4326)
+
+
+plot(st_geometry(saudi))   # visual check: does it look like Saudi Arabia?
+ 
+# NOTE: if you leave out layer = ..., st_read() reads the FIRST layer
+# and warns you that others exist.
+```
+```{r}
+# ---------------------------------------------------------------------
+# 2. WORLD CITIES (Esri shapefile)
+# ---------------------------------------------------------------------
+# A shapefile only has ONE layer, but you can still check:
+st_layers("data/World_Cities.shp")
+ 
+cities <- st_read("data/World_Cities.shp")
+ 
+# Check the column names -- you need to know which column holds the
+# country name and which holds the city name before filtering:
+names(cities)
+head(cities)
+ 
+# Check how Saudi Arabia is spelt in the data (avoid typos in filter):
+unique(cities$CNTRY_NAME) %>% sort()
+
+```
+
+
+```{r}
+# ---------------------------------------------------------------------
+# 3. WORLDCLIM RASTERS -- checking the LAYERS (bands)
+# ---------------------------------------------------------------------
+ssp1 <- rast("data/wc2.1_2.5m_tmax_ACCESS-CM2_ssp126_2081-2100.tif")
+ssp5 <- rast("data/wc2.1_2.5m_tmax_ACCESS-CM2_ssp585_2081-2100.tif")
+ 
+# Rasters also have "layers" (called bands). Check them:
+ssp1             # summary: dimensions, resolution, extent, CRS, nlyr
+nlyr(ssp1)       # number of layers -> should be 12 (one per month)
+names(ssp1)      # default layer names (long, taken from the file)
+ 
+# Rename the 12 layers to month names.
+# names() <- is base R and works on rasters.
+# (dplyr::rename() only works on data frames / tables, NOT rasters.)
+month <- c("Jan","Feb","Mar","Apr","May","Jun",
+           "Jul","Aug","Sep","Oct","Nov","Dec")
+names(ssp1) <- month
+names(ssp5) <- month
+ 
+names(ssp1)      # check it worked
+ 
+# Look at a single layer, e.g. July:
+plot(ssp1[["Jul"]])
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# 4. FILTER CITIES TO SAUDI ARABIA + MATCH CRS
+# ---------------------------------------------------------------------
+saudi_cities <- cities %>%
+  filter(CNTRY_NAME == "Saudi Arabia") %>%
+  st_transform(crs(ssp1))          # make CRS match the raster
+ 
+nrow(saudi_cities)                 # how many cities did we get?
+saudi_cities$CITY_NAME             # which ones?
+ 
+# Optional check: do CRS match?
+st_crs(saudi_cities) == st_crs(saudi)
+```
+
+
+```{r}
+# ---------------------------------------------------------------------
+# 5. CROP & MASK RASTERS TO SAUDI ARABIA
+# ---------------------------------------------------------------------
+# crop() = cut to the bounding box (rectangle) of the country
+# mask() = set cells OUTSIDE the country outline to NA
+ssp1_sa <- ssp1 %>% crop(saudi) %>% mask(saudi)
+ssp5_sa <- ssp5 %>% crop(saudi) %>% mask(saudi)
+ 
+plot(ssp5_sa[["Jul"]])
+plot(st_geometry(saudi_cities), add = TRUE, pch = 19)
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# 6. DIFFERENCE RASTER (SSP5 - SSP1)
+# ---------------------------------------------------------------------
+# Because both rasters have the same 12 layers in the same order,
+# subtraction is done month-by-month (Jan - Jan, Feb - Feb, ...)
+diff <- ssp5_sa - ssp1_sa
+names(diff)      # still Jan..Dec
+plot(diff)
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# 7. EXTRACT VALUES AT EACH CITY
+# ---------------------------------------------------------------------
+city_diff <- terra::extract(diff, vect(saudi_cities)) %>%
+  mutate(city = saudi_cities$CITY_NAME[ID])
+ 
+city_diff        # one row per city, one column per month
+ 
+# CHECK FOR NAs: coastal cities (e.g. Jeddah, Dammam) may fall just
+# outside the masked outline.
+city_diff %>% filter(is.na(Jan))
+ 
+# FIX if needed: extract from the CROPPED but UNMASKED rasters instead
+# diff <- crop(ssp5, saudi) - crop(ssp1, saudi)
+# then re-run step 7.
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# 8. RESHAPE TO LONG FORMAT
+# ---------------------------------------------------------------------
+# Wide: city | Jan | Feb | ... | Dec
+# Long: city | month | diff      <- easier for stats and ggplot
+long <- city_diff %>%
+  pivot_longer(Jan:Dec, names_to = "month", values_to = "diff") %>%
+  mutate(month = factor(month, levels = month.abb))  # keep Jan-Dec order
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# 9. DESCRIPTIVE STATISTICS
+# ---------------------------------------------------------------------
+# Per city
+city_stats <- long %>%
+  group_by(city) %>%
+  summarise(mean = mean(diff, na.rm = TRUE),
+            min  = min(diff,  na.rm = TRUE),
+            max  = max(diff,  na.rm = TRUE),
+            sd   = sd(diff,   na.rm = TRUE)) %>%
+  arrange(desc(mean))
+city_stats
+ 
+# Per month (across all cities)
+month_stats <- long %>%
+  group_by(month) %>%
+  summarise(mean = mean(diff, na.rm = TRUE),
+            sd   = sd(diff,   na.rm = TRUE))
+month_stats
+ 
+# Overall
+summary(long$diff)
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# 10. PLOTS
+# ---------------------------------------------------------------------
+# Histogram of all city-month differences
+ggplot(long, aes(x = diff)) +
+  geom_histogram(binwidth = 0.25) +
+  labs(x = "Tmax difference SSP5 - SSP1 (°C)", y = "Count",
+       title = "Saudi Arabian cities, 2081-2100 (ACCESS-CM2)")
+ 
+# Boxplot by month -- is the gap bigger in summer?
+ggplot(long, aes(x = month, y = diff)) +
+  geom_boxplot() +
+  labs(x = "Month", y = "Tmax difference (°C)")
+ 
+# Boxplot by city -- which cities warm most?
+ggplot(long, aes(x = reorder(city, diff), y = diff)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(x = "City", y = "Tmax difference (°C)")
+```
+
+```{r}
+# ---------------------------------------------------------------------
+# 11. MAP (optional, but helps interpret the statistics)
+# ---------------------------------------------------------------------
+# Quick look with base terra:
+plot(diff[["Jul"]], main = "July tmax difference SSP5 - SSP1 (°C)")
+plot(st_geometry(saudi), add = TRUE)
+plot(st_geometry(saudi_cities), add = TRUE, pch = 19)
+ 
+# Nicer map with ggplot2.
+# Step 1: average the 12 monthly bands into ONE band (annual mean diff)
+diff_annual <- mean(diff)          # cell-by-cell mean across the 12 layers
+names(diff_annual) <- "diff"
+ 
+# Step 2: ggplot can't plot a SpatRaster directly, so convert to a
+# data frame with x, y coordinates + the value of each cell
+diff_df <- as.data.frame(diff_annual, xy = TRUE, na.rm = TRUE)
+head(diff_df)                      # columns: x | y | diff
+ 
+# Step 3: build the map in layers
+ggplot() +
+  geom_raster(data = diff_df, aes(x = x, y = y, fill = diff)) +   # raster
+  geom_sf(data = saudi, fill = NA, colour = "black") +            # outline
+  geom_sf(data = saudi_cities, size = 1.5) +                      # city points
+  geom_sf_text(data = saudi_cities, aes(label = CITY_NAME),       # labels
+               size = 3, nudge_y = 0.4) +
+  scale_fill_viridis_c(option = "inferno",
+                       name = "Tmax diff (°C)") +
+  labs(title = "Difference in max temperature: SSP5-8.5 minus SSP1-2.6",
+       subtitle = "Annual mean, 2081-2100, ACCESS-CM2 (2.5 min)",
+       x = NULL, y = NULL) +
+  theme_minimal()
+ 
+# Save it:
+# ggsave("saudi_tmax_diff_map.png", width = 8, height = 7, dpi = 300)
+```
